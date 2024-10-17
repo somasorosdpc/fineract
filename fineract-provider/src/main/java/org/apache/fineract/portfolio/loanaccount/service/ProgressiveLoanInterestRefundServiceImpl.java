@@ -22,9 +22,11 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.fineract.organisation.monetary.domain.Money;
 import org.apache.fineract.portfolio.loanaccount.domain.Loan;
 import org.apache.fineract.portfolio.loanaccount.domain.LoanRepaymentScheduleInstallment;
 import org.apache.fineract.portfolio.loanaccount.domain.LoanTransaction;
@@ -47,69 +49,71 @@ public class ProgressiveLoanInterestRefundServiceImpl implements InterestRefundS
     private final EMICalculator emiCalculator;
     private final LoanAssembler loanAssembler;
 
-    private ProgressiveLoanInterestScheduleModel getModelSafely(final Loan loan, BigDecimal refundAmount) {
-        final AtomicReference<BigDecimal> refundFinal = new AtomicReference<>(refundAmount);
-        List<LoanTransaction> withoutSpecificDisbursements = loan.getLoanTransactions().stream().filter(lt -> !lt.isReversed())
-                .filter(lt -> !lt.isAccrual() && !lt.isAccrualActivity() && !lt.isReversed()).filter(lt -> {
-                    if (lt.getTypeOf().isDisbursement() && refundFinal.get().compareTo(BigDecimal.ZERO) > 0) {
-                        if (lt.getAmount().compareTo(refundFinal.get()) <= 0) {
-                            refundFinal.set(refundFinal.get().subtract(lt.getAmount()));
-                            return false;
-                        }
-                    }
-                    return true;
-                }).toList();
-        List<LoanTransaction> transactionsToReprocess = withoutSpecificDisbursements.stream().map(lt -> {
-            if (lt.getTypeOf().isDisbursement() && refundFinal.get().compareTo(BigDecimal.ZERO) > 0) {
-                refundFinal.set(BigDecimal.ZERO);
-                return new LoanTransaction(lt.getLoan(), lt.getLoan().getOffice(), lt.getTypeOf().getValue(), lt.getDateOf(),
-                        lt.getAmount().subtract(refundFinal.get()), lt.getPrincipalPortion(), lt.getInterestPortion(),
-                        lt.getFeeChargesPortion(), lt.getPenaltyChargesPortion(),
-                        lt.getOverPaymentPortion(lt.getLoan().getCurrency()).getAmount(), lt.isReversed(), lt.getPaymentDetail(),
-                        lt.getExternalId());
-            }
-            return lt;
-        }).toList();
-
-        List<LoanRepaymentScheduleInstallment> installmentsToReprocess = new ArrayList<>(
-                loan.getRepaymentScheduleInstallments().stream().filter(i -> !i.isReAged() && !i.isAdditional()).toList());
-
-        return processor.reprocessProgressiveLoanTransactions(loan.getDisbursementDate(), transactionsToReprocess, loan.getCurrency(),
-                installmentsToReprocess, loan.getActiveCharges()).getRight();
-    }
-
     @Override
     public boolean canHandle(Loan loan) {
         return loan != null && loan.isInterestBearing() && processor.accept(loan.getTransactionProcessingStrategyCode());
     }
 
-    private BigDecimal calculateTotalPaidInterest(final Loan loan) {
-        return loan.getRepaymentScheduleInstallments().stream().map(i -> i.getInterestPaid(loan.getCurrency()).getAmount())
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    private static boolean omitDisbursements(LoanTransaction lt, final AtomicReference<BigDecimal> refundFinal) {
+        if (lt.getTypeOf().isDisbursement() && refundFinal.get().compareTo(BigDecimal.ZERO) > 0) {
+                if (lt.getAmount().compareTo(refundFinal.get()) <= 0) {
+                    refundFinal.set(refundFinal.get().subtract(lt.getAmount()));
+                    return false;
+                }
+            }
+            return true;
     }
 
-    private BigDecimal calculatePayableInterest(final Loan loan, LocalDate relatedRefundTransactionDate) {
-        ProgressiveLoanInterestScheduleModel modelAfter = getModelSafely(loan, BigDecimal.ZERO);
-        return emiCalculator.getPayableDetails(modelAfter,
-                loan.getRelatedRepaymentScheduleInstallment(relatedRefundTransactionDate).getDueDate(), relatedRefundTransactionDate)
-                .getPayableInterest().getAmount();
+    private static LoanTransaction calculateReducedAmountDisbursements(LoanTransaction lt, final AtomicReference<BigDecimal> refundFinal) {
+        if (lt.getTypeOf().isDisbursement() && refundFinal.get().compareTo(BigDecimal.ZERO) > 0) {
+            LoanTransaction result = new LoanTransaction(lt.getLoan(), lt.getLoan().getOffice(), lt.getTypeOf().getValue(), lt.getDateOf(),
+                    lt.getAmount().subtract(refundFinal.get()), lt.getPrincipalPortion(), lt.getInterestPortion(),
+                    lt.getFeeChargesPortion(), lt.getPenaltyChargesPortion(),
+                    lt.getOverPaymentPortion(lt.getLoan().getCurrency()).getAmount(), lt.isReversed(), lt.getPaymentDetail(),
+                    lt.getExternalId());
+            refundFinal.set(BigDecimal.ZERO);
+            return result;
+        }
+        return lt;
     }
+
+    private BigDecimal totalInterest(final Loan loan, BigDecimal refundAmount,
+                                                                LocalDate relatedRefundTransactionDate) {
+        final AtomicReference<BigDecimal> refundFinal = new AtomicReference<>(refundAmount);
+        List<LoanTransaction> transactionsToReprocess = loan.getLoanTransactions().stream()
+                .filter(lt -> !lt.isReversed()) //
+                .filter(lt -> !lt.isAccrual() && !lt.isAccrualActivity()) //
+                .filter(lt -> omitDisbursements(lt, refundFinal)) //
+                .map(lt-> calculateReducedAmountDisbursements(lt, refundFinal)).toList();
+
+        List<LoanRepaymentScheduleInstallment> installmentsToReprocess = new ArrayList<>(
+                loan.getRepaymentScheduleInstallments().stream().filter(i -> !i.isReAged() && !i.isAdditional()).toList());
+
+        ProgressiveLoanInterestScheduleModel modelAfter = processor.reprocessProgressiveLoanTransactions(loan.getDisbursementDate(), transactionsToReprocess, loan.getCurrency(),
+                installmentsToReprocess, loan.getActiveCharges()).getRight();
+        BigDecimal payableInterest = BigDecimal.ZERO;
+        if (modelAfter != null) {
+            LoanRepaymentScheduleInstallment actualInstallment = loan.getRelatedRepaymentScheduleInstallment(relatedRefundTransactionDate);
+            if (actualInstallment == null) {
+                actualInstallment = loan.getLastLoanRepaymentScheduleInstallment();
+            }
+            payableInterest = emiCalculator.getPayableDetails(modelAfter,
+                            actualInstallment.getDueDate(), relatedRefundTransactionDate)
+                    .getPayableInterest().getAmount();
+        }
+        BigDecimal paidInterest = installmentsToReprocess.stream().map(i -> i.getInterestPaid(loan.getCurrency())).filter(Objects::nonNull).map(Money::getAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        return payableInterest.add(paidInterest);
+    }
+
 
     @Override
     @Transactional(readOnly = true, propagation = Propagation.REQUIRES_NEW)
     public BigDecimal calculateInterestRefundAmount(Long loanId, BigDecimal relatedRefundTransactionAmount,
             LocalDate relatedRefundTransactionDate) {
         Loan loan = loanAssembler.assembleFrom(loanId);
-        BigDecimal totalPaidInterest = calculateTotalPaidInterest(loan);
-        BigDecimal totalPayableInterestBeforeTransaction = calculatePayableInterest(loan, relatedRefundTransactionDate);
-        ProgressiveLoanInterestScheduleModel modelAfter = getModelSafely(loan, relatedRefundTransactionAmount);
-        BigDecimal payableInterestWithoutDisbursement = BigDecimal.ZERO;
-        if (modelAfter != null) {
-            payableInterestWithoutDisbursement = emiCalculator.getPayableDetails(modelAfter,
-                    loan.getRelatedRepaymentScheduleInstallment(relatedRefundTransactionDate).getDueDate(), relatedRefundTransactionDate)
-                    .getPayableInterest().getAmount();
-
-        }
-        return totalPaidInterest.add(totalPayableInterestBeforeTransaction).subtract(payableInterestWithoutDisbursement);
+       BigDecimal totalInterestBeforeRefund = totalInterest(loan, BigDecimal.ZERO, relatedRefundTransactionDate);
+       BigDecimal totalInterestAfterRefund = totalInterest(loan, relatedRefundTransactionAmount, relatedRefundTransactionDate);
+        return totalInterestBeforeRefund.subtract(totalInterestAfterRefund);
     }
 }
